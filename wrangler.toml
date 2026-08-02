@@ -1,0 +1,9 @@
+name = "bulk-file-downloader-license"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+# Fill in `id` after creating the KV namespace (either via the Cloudflare
+# connector in chat, or `wrangler kv namespace create CODES`).
+[[kv_namespaces]]
+binding = "CODES"
+id = "610ecc5dbe0e4530993fab5442cc2496"
