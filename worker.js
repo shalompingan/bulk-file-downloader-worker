@@ -6,18 +6,21 @@
 // where anyone could read them for free.
 //
 // This Worker is the ONLY thing that knows whether a given code has already
-// been redeemed. The extension never holds a list of valid codes — it just
+// been redeemed. The extension never holds a list of valid codes -- it just
 // asks this Worker "is BFD-XXXX-XXXX good to activate on device Y?" and
 // gets back yes/no.
 //
-// Storage: a KV namespace bound as `CODES`. Each key is a code
-// (e.g. "BFD-2FXX-RKXD"), each value is JSON:
-//   { redeemed: boolean, deviceIds: string[], firstActivatedAt?: number }
-// Un-redeemed codes should be seeded with { redeemed: false, deviceIds: [] }
-// before this goes live (see seed-kv.js in this same folder).
+// Storage: a D1 database bound as `DB`, table `codes` with columns
+// (code TEXT PRIMARY KEY, redeemed INTEGER, device_ids TEXT, first_activated_at INTEGER).
+// device_ids is a JSON-encoded array stored as text (D1/SQLite has no native
+// array type). All 200 codes were seeded with redeemed=0, device_ids='[]'
+// directly via SQL -- see CLAUDE.md for how (switched from Workers KV to D1
+// because the Cloudflare account's connected tooling could create a KV
+// namespace but had no way to bulk-write key/value pairs into it, whereas D1
+// accepts arbitrary SQL including bulk INSERT).
 //
 // A code allows up to MAX_DEVICES activations so a legitimate buyer can use
-// it on e.g. a work laptop and a home laptop without being blocked — this is
+// it on e.g. a work laptop and a home laptop without being blocked -- this is
 // a deliberate compromise, not a bug. Sharing a code publicly still gets cut
 // off after MAX_DEVICES people redeem it, instead of being unlimited like
 // the old client-side check.
@@ -52,49 +55,53 @@ async function handleActivate(request, env) {
   const deviceId = String(body.deviceId || "").trim();
 
   // deviceId is a random UUID the extension generates once on first install
-  // and stores in chrome.storage.local — it identifies "this install", not a
+  // and stores in chrome.storage.local -- it identifies "this install", not a
   // real hardware fingerprint. Good enough to raise the bar above "completely
   // unlimited," not meant to be un-defeatable.
   if (!code || !/^BFD-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(code) || !deviceId) {
     return withCors(json({ ok: false, reason: "bad_request" }, 400));
   }
 
-  const raw = await env.CODES.get(code);
-  if (raw === null) {
+  const row = await env.DB.prepare(
+    "SELECT redeemed, device_ids FROM codes WHERE code = ?"
+  ).bind(code).first();
+
+  if (!row) {
     return withCors(json({ ok: false, reason: "invalid" }, 404));
   }
 
-  let record;
+  let deviceIds;
   try {
-    record = JSON.parse(raw);
+    deviceIds = JSON.parse(row.device_ids || "[]");
   } catch {
-    record = { redeemed: false, deviceIds: [] };
+    deviceIds = [];
   }
-  if (!Array.isArray(record.deviceIds)) record.deviceIds = [];
+  if (!Array.isArray(deviceIds)) deviceIds = [];
 
   // First redemption of this code.
-  if (!record.redeemed) {
-    record.redeemed = true;
-    record.deviceIds = [deviceId];
-    record.firstActivatedAt = Date.now();
-    await env.CODES.put(code, JSON.stringify(record));
+  if (!row.redeemed) {
+    await env.DB.prepare(
+      "UPDATE codes SET redeemed = 1, device_ids = ?, first_activated_at = ? WHERE code = ?"
+    ).bind(JSON.stringify([deviceId]), Date.now(), code).run();
     return withCors(json({ ok: true }));
   }
 
-  // Same device re-activating (reinstall, clicked Activate twice, etc.) —
+  // Same device re-activating (reinstall, clicked Activate twice, etc.) --
   // idempotent, always allow.
-  if (record.deviceIds.includes(deviceId)) {
+  if (deviceIds.includes(deviceId)) {
     return withCors(json({ ok: true }));
   }
 
   // A new device, but still under the per-code device cap.
-  if (record.deviceIds.length < MAX_DEVICES) {
-    record.deviceIds.push(deviceId);
-    await env.CODES.put(code, JSON.stringify(record));
+  if (deviceIds.length < MAX_DEVICES) {
+    deviceIds.push(deviceId);
+    await env.DB.prepare(
+      "UPDATE codes SET device_ids = ? WHERE code = ?"
+    ).bind(JSON.stringify(deviceIds), code).run();
     return withCors(json({ ok: true }));
   }
 
-  // Cap reached — this code has already been activated on MAX_DEVICES
+  // Cap reached -- this code has already been activated on MAX_DEVICES
   // different installs.
   return withCors(json({ ok: false, reason: "already_used" }, 409));
 }
@@ -108,7 +115,7 @@ function json(obj, status = 200) {
 
 // The extension calls this from a chrome-extension:// origin, not a regular
 // web page, so a permissive CORS policy here isn't handing out access to
-// anything sensitive — the only thing this API does is check/burn a code.
+// anything sensitive -- the only thing this API does is check/burn a code.
 function withCors(response) {
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", "*");
