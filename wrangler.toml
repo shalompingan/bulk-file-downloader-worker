@@ -2,7 +2,15 @@ name = "bulk-file-downloader-license"
 main = "worker.js"
 compatibility_date = "2026-08-01"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "bulk-file-downloader-codes"
-database_id = "4c9d874f-cbd2-4bf0-8a8f-0ecd7b5e2325"
+# CREEM_API_BASE is not secret -- safe to commit. Points at Creem's test API
+# while validating the new license-key flow; switch to
+# "https://api.creem.io" (drop "test-") once ready to accept real purchases.
+[vars]
+CREEM_API_BASE = "https://test-api.creem.io"
+
+# CREEM_API_KEY is a SECRET and must NOT be added here (this file is pushed
+# to a public GitHub repo that Cloudflare deploys from). Set it instead in
+# the Cloudflare dashboard: Worker > Settings > Variables and Secrets >
+# Add > Type: Secret > Name: CREEM_API_KEY. Use the Test API key from
+# Creem's Developers section while CREEM_API_BASE above is the test URL;
+# swap to the Production API key when you flip CREEM_API_BASE to live.

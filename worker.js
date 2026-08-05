@@ -1,31 +1,31 @@
 // worker.js
 //
-// Cloudflare Worker: server-side redemption check for Bulk File Downloader
-// activation codes. Replaces the old client-side VALID_CODES list in
-// popup.js, which shipped all 200 valid codes inside the extension source
-// where anyone could read them for free.
+// Cloudflare Worker: thin, secure proxy between the extension and Creem's
+// license key API.
 //
-// This Worker is the ONLY thing that knows whether a given code has already
-// been redeemed. The extension never holds a list of valid codes -- it just
-// asks this Worker "is BFD-XXXX-XXXX good to activate on device Y?" and
-// gets back yes/no.
+// WHY THIS PROXY EXISTS AT ALL (don't remove it and call Creem directly from
+// the extension): Creem's license validate/activate endpoints require an
+// `x-api-key` header. Creem's own docs are explicit that this key must never
+// be shipped in client-side code -- an extension's popup.js is exactly that,
+// readable by anyone who unpacks the .crx. So this Worker holds the API key
+// as a server-side secret, and the extension only ever talks to this Worker,
+// never to api.creem.io directly.
 //
-// Storage: a D1 database bound as `DB`, table `codes` with columns
-// (code TEXT PRIMARY KEY, redeemed INTEGER, device_ids TEXT, first_activated_at INTEGER).
-// device_ids is a JSON-encoded array stored as text (D1/SQLite has no native
-// array type). All 200 codes were seeded with redeemed=0, device_ids='[]'
-// directly via SQL -- see CLAUDE.md for how (switched from Workers KV to D1
-// because the Cloudflare account's connected tooling could create a KV
-// namespace but had no way to bulk-write key/value pairs into it, whereas D1
-// accepts arbitrary SQL including bulk INSERT).
+// This REPLACES the old design (see CLAUDE.md / git history) where this
+// Worker queried its own D1 database of 200 pre-generated codes. That whole
+// system -- the D1 table, the Google Sheet code pool, the Make.com scenario
+// that looked up an unused code and emailed it -- is retired. Creem now
+// generates a fresh license key automatically for every real purchase and
+// emails it to the buyer itself. This Worker's only job is: given a code +
+// a device id, ask Creem's API "is this valid, can this device use it?"
+// and translate the answer into the same {ok:true} / {ok:false, reason}
+// shape the extension already expects, so popup.js needed zero changes.
 //
-// A code allows up to MAX_DEVICES activations so a legitimate buyer can use
-// it on e.g. a work laptop and a home laptop without being blocked -- this is
-// a deliberate compromise, not a bug. Sharing a code publicly still gets cut
-// off after MAX_DEVICES people redeem it, instead of being unlimited like
-// the old client-side check.
-
-const MAX_DEVICES = 3;
+// Config (set in the Cloudflare dashboard, Worker > Settings > Variables):
+//   CREEM_API_KEY   (secret)   -- test key while validating, swap to the
+//                                 live key before shipping to real users
+//   CREEM_API_BASE  (var)      -- "https://test-api.creem.io" during testing,
+//                                 "https://api.creem.io" once live
 
 export default {
   async fetch(request, env) {
@@ -51,59 +51,62 @@ async function handleActivate(request, env) {
     return withCors(json({ ok: false, reason: "bad_request" }, 400));
   }
 
-  const code = String(body.code || "").trim().toUpperCase();
+  // Creem license keys don't follow the old BFD-XXXX-XXXX shape, so this is
+  // deliberately just a non-empty check, not a format check.
+  const code = String(body.code || "").trim();
   const deviceId = String(body.deviceId || "").trim();
 
-  // deviceId is a random UUID the extension generates once on first install
-  // and stores in chrome.storage.local -- it identifies "this install", not a
-  // real hardware fingerprint. Good enough to raise the bar above "completely
-  // unlimited," not meant to be un-defeatable.
-  if (!code || !/^BFD-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(code) || !deviceId) {
+  if (!code || !deviceId) {
     return withCors(json({ ok: false, reason: "bad_request" }, 400));
   }
 
-  const row = await env.DB.prepare(
-    "SELECT redeemed, device_ids FROM codes WHERE code = ?"
-  ).bind(code).first();
+  if (!env.CREEM_API_KEY || !env.CREEM_API_BASE) {
+    // Misconfigured Worker (missing secret/var) -- fail closed, don't leak
+    // details to the client.
+    console.error("Worker misconfigured: CREEM_API_KEY or CREEM_API_BASE not set");
+    return withCors(json({ ok: false, reason: "bad_response" }, 500));
+  }
 
-  if (!row) {
+  let creemRes;
+  try {
+    creemRes = await fetch(`${env.CREEM_API_BASE}/v1/licenses/activate`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "x-api-key": env.CREEM_API_KEY,
+        "Content-Type": "application/json"
+      },
+      // instance_name is just a label on Creem's side (per their docs) --
+      // we pass our random per-install deviceId so each install shows up as
+      // a distinct, identifiable instance in the Creem dashboard.
+      body: JSON.stringify({ key: code, instance_name: deviceId })
+    });
+  } catch (err) {
+    console.error("Creem API request failed:", err);
+    return withCors(json({ ok: false, reason: "bad_response" }, 502));
+  }
+
+  if (creemRes.ok) {
+    return withCors(json({ ok: true }));
+  }
+
+  // Map Creem's error codes (see docs.creem.io/features/addons/licenses)
+  // onto the reasons popup.js already knows how to show a message for.
+  if (creemRes.status === 403) {
+    // Activation limit reached for this key.
+    return withCors(json({ ok: false, reason: "already_used" }, 409));
+  }
+  if (creemRes.status === 404 || creemRes.status === 410) {
+    // Unknown key, or revoked/expired.
     return withCors(json({ ok: false, reason: "invalid" }, 404));
   }
 
-  let deviceIds;
-  try {
-    deviceIds = JSON.parse(row.device_ids || "[]");
-  } catch {
-    deviceIds = [];
-  }
-  if (!Array.isArray(deviceIds)) deviceIds = [];
-
-  // First redemption of this code.
-  if (!row.redeemed) {
-    await env.DB.prepare(
-      "UPDATE codes SET redeemed = 1, device_ids = ?, first_activated_at = ? WHERE code = ?"
-    ).bind(JSON.stringify([deviceId]), Date.now(), code).run();
-    return withCors(json({ ok: true }));
-  }
-
-  // Same device re-activating (reinstall, clicked Activate twice, etc.) --
-  // idempotent, always allow.
-  if (deviceIds.includes(deviceId)) {
-    return withCors(json({ ok: true }));
-  }
-
-  // A new device, but still under the per-code device cap.
-  if (deviceIds.length < MAX_DEVICES) {
-    deviceIds.push(deviceId);
-    await env.DB.prepare(
-      "UPDATE codes SET device_ids = ? WHERE code = ?"
-    ).bind(JSON.stringify(deviceIds), code).run();
-    return withCors(json({ ok: true }));
-  }
-
-  // Cap reached -- this code has already been activated on MAX_DEVICES
-  // different installs.
-  return withCors(json({ ok: false, reason: "already_used" }, 409));
+  // Anything else (401 = our own API key is wrong, 400 = malformed request,
+  // 5xx = Creem's side having issues) -- don't try to guess further, just
+  // fail closed with a generic reason.
+  const text = await creemRes.text().catch(() => "");
+  console.error(`Creem activate returned ${creemRes.status}: ${text}`);
+  return withCors(json({ ok: false, reason: "bad_response" }, 502));
 }
 
 function json(obj, status = 200) {
