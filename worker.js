@@ -1,31 +1,30 @@
 // worker.js
 //
-// Cloudflare Worker: thin, secure proxy between the extension and Creem's
+// Cloudflare Worker: thin proxy between the extension and Dodo Payments'
 // license key API.
 //
-// WHY THIS PROXY EXISTS AT ALL (don't remove it and call Creem directly from
-// the extension): Creem's license validate/activate endpoints require an
-// `x-api-key` header. Creem's own docs are explicit that this key must never
-// be shipped in client-side code -- an extension's popup.js is exactly that,
-// readable by anyone who unpacks the .crx. So this Worker holds the API key
-// as a server-side secret, and the extension only ever talks to this Worker,
-// never to api.creem.io directly.
+// WHY THIS PROXY EXISTS (even though Dodo's activate/validate endpoints are
+// public and need no API key -- unlike Creem's, which is why this Worker was
+// originally built): keeping this indirection layer means that if Dodo ever
+// changes its API shape, or we ever need to switch payment processors again,
+// we only have to edit and redeploy this Worker (takes seconds, no review).
+// Without it, any backend change would require shipping a new popup.js,
+// which means a new Chrome Web Store submission and another review wait.
+// This is the second processor this Worker has fronted -- it was Creem
+// before Creem's account review rejected us. See CLAUDE.md for that history.
 //
-// This REPLACES the old design (see CLAUDE.md / git history) where this
-// Worker queried its own D1 database of 200 pre-generated codes. That whole
-// system -- the D1 table, the Google Sheet code pool, the Make.com scenario
-// that looked up an unused code and emailed it -- is retired. Creem now
-// generates a fresh license key automatically for every real purchase and
-// emails it to the buyer itself. This Worker's only job is: given a code +
-// a device id, ask Creem's API "is this valid, can this device use it?"
-// and translate the answer into the same {ok:true} / {ok:false, reason}
-// shape the extension already expects, so popup.js needed zero changes.
+// This Worker's only job: given a license key + a device id, ask Dodo's API
+// "is this valid, can this device activate it?" and translate the answer
+// into the same {ok:true} / {ok:false, reason} shape the extension already
+// expects, so popup.js needs zero changes.
 //
 // Config (set in the Cloudflare dashboard, Worker > Settings > Variables):
-//   CREEM_API_KEY   (secret)   -- test key while validating, swap to the
-//                                 live key before shipping to real users
-//   CREEM_API_BASE  (var)      -- "https://test-api.creem.io" during testing,
-//                                 "https://api.creem.io" once live
+//   DODO_API_BASE  (var, NOT secret) -- "https://test.dodopayments.com"
+//                                       during testing, "https://live.dodopayments.com"
+//                                       once live. No API key needed --
+//                                       Dodo's license endpoints are public,
+//                                       designed to be called straight from
+//                                       client apps.
 
 export default {
   async fetch(request, env) {
@@ -51,7 +50,7 @@ async function handleActivate(request, env) {
     return withCors(json({ ok: false, reason: "bad_request" }, 400));
   }
 
-  // Creem license keys don't follow the old BFD-XXXX-XXXX shape, so this is
+  // Dodo license keys don't follow the old BFD-XXXX-XXXX shape, so this is
   // deliberately just a non-empty check, not a format check.
   const code = String(body.code || "").trim();
   const deviceId = String(body.deviceId || "").trim();
@@ -60,52 +59,52 @@ async function handleActivate(request, env) {
     return withCors(json({ ok: false, reason: "bad_request" }, 400));
   }
 
-  if (!env.CREEM_API_KEY || !env.CREEM_API_BASE) {
-    // Misconfigured Worker (missing secret/var) -- fail closed, don't leak
-    // details to the client.
-    console.error("Worker misconfigured: CREEM_API_KEY or CREEM_API_BASE not set");
+  if (!env.DODO_API_BASE) {
+    // Misconfigured Worker (missing var) -- fail closed, don't leak details
+    // to the client.
+    console.error("Worker misconfigured: DODO_API_BASE not set");
     return withCors(json({ ok: false, reason: "bad_response" }, 500));
   }
 
-  let creemRes;
+  let dodoRes;
   try {
-    creemRes = await fetch(`${env.CREEM_API_BASE}/v1/licenses/activate`, {
+    dodoRes = await fetch(`${env.DODO_API_BASE}/licenses/activate`, {
       method: "POST",
       headers: {
         accept: "application/json",
-        "x-api-key": env.CREEM_API_KEY,
         "Content-Type": "application/json"
       },
-      // instance_name is just a label on Creem's side (per their docs) --
-      // we pass our random per-install deviceId so each install shows up as
-      // a distinct, identifiable instance in the Creem dashboard.
-      body: JSON.stringify({ key: code, instance_name: deviceId })
+      // `name` is just a label on Dodo's side (shows up per-instance in
+      // their dashboard) -- we pass our random per-install deviceId so each
+      // install is a distinct, identifiable activation.
+      body: JSON.stringify({ license_key: code, name: deviceId })
     });
   } catch (err) {
-    console.error("Creem API request failed:", err);
+    console.error("Dodo API request failed:", err);
     return withCors(json({ ok: false, reason: "bad_response" }, 502));
   }
 
-  if (creemRes.ok) {
+  // 201 = license key instance created successfully.
+  if (dodoRes.status === 201) {
     return withCors(json({ ok: true }));
   }
 
-  // Map Creem's error codes (see docs.creem.io/features/addons/licenses)
+  // Map Dodo's error codes (see docs.dodopayments.com/api-reference/licenses)
   // onto the reasons popup.js already knows how to show a message for.
-  if (creemRes.status === 403) {
+  if (dodoRes.status === 422) {
     // Activation limit reached for this key.
     return withCors(json({ ok: false, reason: "already_used" }, 409));
   }
-  if (creemRes.status === 404 || creemRes.status === 410) {
-    // Unknown key, or revoked/expired.
+  if (dodoRes.status === 403 || dodoRes.status === 404) {
+    // 403 = key exists but is inactive/revoked/expired. 404 = unknown key.
     return withCors(json({ ok: false, reason: "invalid" }, 404));
   }
 
-  // Anything else (401 = our own API key is wrong, 400 = malformed request,
-  // 5xx = Creem's side having issues) -- don't try to guess further, just
-  // fail closed with a generic reason.
-  const text = await creemRes.text().catch(() => "");
-  console.error(`Creem activate returned ${creemRes.status}: ${text}`);
+  // Anything else (400 = malformed request, 5xx = Dodo's side having
+  // issues) -- don't try to guess further, just fail closed with a generic
+  // reason.
+  const text = await dodoRes.text().catch(() => "");
+  console.error(`Dodo activate returned ${dodoRes.status}: ${text}`);
   return withCors(json({ ok: false, reason: "bad_response" }, 502));
 }
 
