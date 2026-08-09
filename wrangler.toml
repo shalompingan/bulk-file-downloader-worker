@@ -2,15 +2,13 @@ name = "bulk-file-downloader-license"
 main = "worker.js"
 compatibility_date = "2026-08-01"
 
-# CREEM_API_BASE is not secret -- safe to commit. Points at Creem's test API
-# while validating the new license-key flow; switch to
-# "https://api.creem.io" (drop "test-") once ready to accept real purchases.
+# DODO_API_BASE is not secret -- safe to commit. Points at Dodo Payments'
+# test server while validating the new license-key flow; switch to
+# "https://live.dodopayments.com" once ready to accept real purchases.
+#
+# No API key/secret is needed at all -- Dodo's license activate/validate
+# endpoints are public by design (see docs.dodopayments.com), unlike Creem's
+# which required a secret x-api-key header. One less thing to configure or
+# leak.
 [vars]
-CREEM_API_BASE = "https://test-api.creem.io"
-
-# CREEM_API_KEY is a SECRET and must NOT be added here (this file is pushed
-# to a public GitHub repo that Cloudflare deploys from). Set it instead in
-# the Cloudflare dashboard: Worker > Settings > Variables and Secrets >
-# Add > Type: Secret > Name: CREEM_API_KEY. Use the Test API key from
-# Creem's Developers section while CREEM_API_BASE above is the test URL;
-# swap to the Production API key when you flip CREEM_API_BASE to live.
+DODO_API_BASE = "https://test.dodopayments.com"
